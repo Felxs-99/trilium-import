@@ -91,25 +91,35 @@ def make_headers(token: str) -> dict:
     return {"Authorization": token}
 
 
-def search_note(base_url: str, token: str, query: str, verify: str | bool = True) -> str | None:
+def _looks_like_note_id(s: str) -> bool:
+    """Trilium note IDs are alphanumeric and typically ≥10 chars with no spaces."""
+    return len(s) >= 10 and s.isalnum()
+
+
+def search_children(
+    base_url: str,
+    token: str,
+    parent_id: str,
+    title: str,
+    verify: str | bool = True,
+) -> list[dict]:
     """
-    Search for a note by title/query. Returns the first matching note ID, or None.
+    Find notes whose title matches `title` directly under `parent_id`.
+    Prefers exact title match; falls back to fuzzy if no exact hits.
     """
     try:
         resp = requests.get(
             f"{base_url}/etapi/notes",
             headers=make_headers(token),
-            params={"search": query},
+            params={
+                "search": title,
+                "ancestorNoteId": parent_id,
+                "ancestorDepth": "eq1",
+            },
             timeout=10,
             verify=verify,
         )
         resp.raise_for_status()
-        results = resp.json().get("results", [])
-        if results:
-            note_id = results[0].get("noteId")
-            title   = results[0].get("title", "?")
-            print(f"  Resolved '{query}' → note '{title}' (ID: {note_id})")
-            return note_id
     except requests.exceptions.SSLError as e:
         print(
             f"Error: TLS verification failed for {base_url}.\n"
@@ -124,28 +134,53 @@ def search_note(base_url: str, token: str, query: str, verify: str | bool = True
         print(f"Error searching for note: {e}")
         sys.exit(1)
 
-    return None
+    results = resp.json().get("results", [])
+    target = title.casefold()
+    exact = [r for r in results if r.get("title", "").casefold() == target]
+    return exact or results
 
 
 def resolve_parent(base_url: str, token: str, parent_arg: str, verify: str | bool = True) -> str:
     """
     Resolve --parent to a note ID.
-    If it looks like a note ID (alphanumeric, ~12+ chars), use it directly.
-    Otherwise, search by title.
+
+    Accepts:
+      - "root"                          → root note
+      - "abcdef123456"                  → direct note ID
+      - "Import Nodes"                  → search title directly under root
+      - "Import Nodes/Project A/Sub"    → walk path, each segment is a direct
+                                          child of the previous one
+    Any segment that looks like a note ID is used as-is (no search).
     """
-    # Heuristic: Trilium note IDs are alphanumeric and typically 12 chars
     if parent_arg == "root":
         return "root"
 
-    if len(parent_arg) >= 10 and parent_arg.isalnum():
-        print(f"  Using '{parent_arg}' as direct note ID.")
-        return parent_arg
+    segments = [s.strip() for s in parent_arg.split("/") if s.strip()]
+    if not segments:
+        return "root"
 
-    note_id = search_note(base_url, token, parent_arg, verify=verify)
-    if note_id is None:
-        print(f"Error: No note found matching '{parent_arg}'. Try using a note ID instead.")
-        sys.exit(1)
-    return note_id
+    current = "root"
+    for seg in segments:
+        if _looks_like_note_id(seg):
+            print(f"  Using '{seg}' as direct note ID.")
+            current = seg
+            continue
+
+        matches = search_children(base_url, token, current, seg, verify=verify)
+        if not matches:
+            parent_label = "root" if current == "root" else current
+            print(f"Error: No child note '{seg}' under '{parent_label}'.")
+            sys.exit(1)
+
+        if len(matches) > 1:
+            titles = ", ".join(repr(m.get("title", "?")) for m in matches[:5])
+            print(f"  Warning: multiple matches for '{seg}' ({titles}). Using first.")
+
+        match = matches[0]
+        print(f"  Resolved '{seg}' → '{match.get('title', '?')}' (ID: {match.get('noteId')})")
+        current = match.get("noteId")
+
+    return current
 
 
 def prepare_content(file_path: Path, raw: str) -> tuple[str, str]:
@@ -243,7 +278,11 @@ def main():
     parser.add_argument(
         "--parent", "-p",
         default=None,
-        help="Parent note title or ID (overrides TRILIUM_DEFAULT_PARENT)",
+        help=(
+            "Parent note: 'root', a note ID, a title, or a slash-separated path "
+            "(e.g. 'Import Nodes/Project A/Subfolder'). "
+            "Overrides TRILIUM_DEFAULT_PARENT."
+        ),
     )
     parser.add_argument(
         "--title", "-t",
