@@ -30,6 +30,14 @@ except ImportError:
     print("Error: 'python-dotenv' not installed. Run: pip install python-dotenv")
     sys.exit(1)
 
+try:
+    import markdown as _markdown
+except ImportError:
+    print("Error: 'markdown' not installed. Run: pip install markdown")
+    sys.exit(1)
+
+import html as _html
+
 
 # ── Config loading ────────────────────────────────────────────────────────────
 
@@ -55,33 +63,60 @@ def load_config() -> dict:
         )
         sys.exit(1)
 
-    return {"url": url, "token": token, "default_parent": default_parent}
+    # Resolve TLS verify setting:
+    # 1. Explicit TRILIUM_CA_BUNDLE wins.
+    # 2. Otherwise, use system CA bundle if present (covers internal CAs trusted by the OS).
+    # 3. Otherwise, fall back to certifi default (True).
+    ca_bundle = os.getenv("TRILIUM_CA_BUNDLE", "").strip()
+    if ca_bundle:
+        verify: str | bool = ca_bundle
+    elif Path("/etc/ssl/certs/ca-certificates.crt").exists():
+        verify = "/etc/ssl/certs/ca-certificates.crt"
+    else:
+        verify = True
+
+    return {
+        "url": url,
+        "token": token,
+        "default_parent": default_parent,
+        "verify": verify,
+    }
 
 
 # ── Trilium API helpers ───────────────────────────────────────────────────────
 
 def make_headers(token: str) -> dict:
-    return {"Authorization": f"Basic {token}"}
+    # Trilium ETAPI expects the raw token as the Authorization header value
+    # (not Basic, not Bearer).
+    return {"Authorization": token}
 
 
-def search_note(base_url: str, token: str, query: str) -> str | None:
+def search_note(base_url: str, token: str, query: str, verify: str | bool = True) -> str | None:
     """
     Search for a note by title/query. Returns the first matching note ID, or None.
     """
     try:
         resp = requests.get(
-            f"{base_url}/api/notes",
+            f"{base_url}/etapi/notes",
             headers=make_headers(token),
             params={"search": query},
             timeout=10,
+            verify=verify,
         )
         resp.raise_for_status()
-        results = resp.json()
+        results = resp.json().get("results", [])
         if results:
             note_id = results[0].get("noteId")
             title   = results[0].get("title", "?")
             print(f"  Resolved '{query}' → note '{title}' (ID: {note_id})")
             return note_id
+    except requests.exceptions.SSLError as e:
+        print(
+            f"Error: TLS verification failed for {base_url}.\n"
+            f"  {e}\n"
+            "  Set TRILIUM_CA_BUNDLE in ~/.trilium-import.env to a CA bundle that trusts the server cert."
+        )
+        sys.exit(1)
     except requests.exceptions.ConnectionError:
         print(f"Error: Cannot reach Trilium at {base_url}. Is it running and on the same network?")
         sys.exit(1)
@@ -92,7 +127,7 @@ def search_note(base_url: str, token: str, query: str) -> str | None:
     return None
 
 
-def resolve_parent(base_url: str, token: str, parent_arg: str) -> str:
+def resolve_parent(base_url: str, token: str, parent_arg: str, verify: str | bool = True) -> str:
     """
     Resolve --parent to a note ID.
     If it looks like a note ID (alphanumeric, ~12+ chars), use it directly.
@@ -106,22 +141,30 @@ def resolve_parent(base_url: str, token: str, parent_arg: str) -> str:
         print(f"  Using '{parent_arg}' as direct note ID.")
         return parent_arg
 
-    note_id = search_note(base_url, token, parent_arg)
+    note_id = search_note(base_url, token, parent_arg, verify=verify)
     if note_id is None:
         print(f"Error: No note found matching '{parent_arg}'. Try using a note ID instead.")
         sys.exit(1)
     return note_id
 
 
-def detect_note_type(file_path: Path) -> str:
-    """Map file extension to Trilium note type."""
+def prepare_content(file_path: Path, raw: str) -> tuple[str, str]:
+    """
+    Convert file content into a (content, note_type) pair suitable for Trilium's
+    ETAPI create-note endpoint. Trilium has no native "markdown" or "html" type:
+    text notes store HTML. So we normalize everything to type="text".
+    """
     ext = file_path.suffix.lower()
-    mapping = {
-        ".md":   "markdown",
-        ".html": "html",
-        ".txt":  "text",
-    }
-    return mapping.get(ext, "text")
+    if ext == ".md":
+        html_body = _markdown.markdown(
+            raw,
+            extensions=["fenced_code", "tables", "sane_lists", "nl2br"],
+        )
+        return html_body, "text"
+    if ext == ".html":
+        return raw, "text"
+    # .txt and unknown: escape and wrap in <pre> so whitespace is preserved.
+    return f"<pre>{_html.escape(raw)}</pre>", "text"
 
 
 def create_note(
@@ -131,6 +174,7 @@ def create_note(
     title: str,
     content: str,
     note_type: str,
+    verify: str | bool = True,
 ) -> dict:
     """Create a note via the Trilium API and return the response JSON."""
     payload = {
@@ -141,13 +185,21 @@ def create_note(
     }
     try:
         resp = requests.post(
-            f"{base_url}/api/create-note",
+            f"{base_url}/etapi/create-note",
             headers={**make_headers(token), "Content-Type": "application/json"},
             json=payload,
             timeout=15,
+            verify=verify,
         )
         resp.raise_for_status()
         return resp.json()
+    except requests.exceptions.SSLError as e:
+        print(
+            f"Error: TLS verification failed for {base_url}.\n"
+            f"  {e}\n"
+            "  Set TRILIUM_CA_BUNDLE in ~/.trilium-import.env to a CA bundle that trusts the server cert."
+        )
+        sys.exit(1)
     except requests.exceptions.ConnectionError:
         print(f"Error: Cannot reach Trilium at {base_url}.")
         sys.exit(1)
@@ -241,12 +293,12 @@ def main():
     # Resolve title
     title = args.title or file_path.stem
 
-    # Resolve note type
-    note_type = detect_note_type(file_path)
+    # Convert content to Trilium-compatible HTML + note type
+    content, note_type = prepare_content(file_path, content)
 
     # Resolve parent
     parent_arg = args.parent or config["default_parent"]
-    parent_id  = resolve_parent(config["url"], config["token"], parent_arg)
+    parent_id  = resolve_parent(config["url"], config["token"], parent_arg, verify=config["verify"])
 
     # Summary
     print(f"\n  File   : {file_path}")
@@ -267,6 +319,7 @@ def main():
         title=title,
         content=content,
         note_type=note_type,
+        verify=config["verify"],
     )
 
     note_id = result.get("note", {}).get("noteId") or result.get("noteId", "?")
