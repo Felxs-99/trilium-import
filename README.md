@@ -18,15 +18,22 @@ Markdown files are converted to HTML so they render natively inside Trilium
 ## Install
 
 ```bash
-git clone https://forgejo.internal/Felxs/trilium-import.git
+git clone https://github.com/Felxs-99/trilium-import.git
 cd trilium-import
+```
 
+**Arch Linux (system-wide):**
+```bash
+sudo pacman -S python-requests python-dotenv python-markdown
+```
+
+**Other distros / virtualenv:**
+```bash
 python -m venv .venv
 .venv/bin/pip install requests python-dotenv markdown
 ```
 
-The script's shebang points at `.venv/bin/python`, so once installed you can
-run it directly:
+Once installed you can run it directly:
 
 ```bash
 ./trilium_import.py --help
