@@ -1,3 +1,6 @@
+> [!NOTE]
+> This project was built with [Claude Code](https://claude.ai/code) (Anthropic).
+
 # trilium-import
 
 CLI tool to import local files (`.md`, `.html`, `.txt`) into a self-hosted
