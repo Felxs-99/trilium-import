@@ -1,4 +1,4 @@
-#!/home/felxs/Documents/VibeCoding/trilium-import/.venv/bin/python
+#!/usr/bin/env python3
 """
 trilium-import: CLI tool to import files into a self-hosted Trilium Notes instance.
 
